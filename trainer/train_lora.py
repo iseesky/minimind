@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import SFTDataset
 from model.model_lora import save_lora, apply_lora
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler, resolve_dtype
 
 warnings.filterwarnings('ignore')
 
@@ -27,7 +27,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate, args.warmup_ratio)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
@@ -70,13 +70,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind LoRA Fine-tuning")
     parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
     parser.add_argument("--lora_rank", default=16, type=int, help="LoRA rank")
+    parser.add_argument("--lora_alpha", default=None, type=float, help="LoRA alpha（默认等于 rank，即 scaling=1）")
     parser.add_argument("--lora_name", type=str, default="lora_medical", help="LoRA权重名称(如lora_identity/lora_medical等)")
     parser.add_argument("--epochs", type=int, default=10, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
+    parser.add_argument("--warmup_ratio", type=float, default=0.0, help="线性warmup占总步数比例，0为关闭")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=0 if os.name == 'nt' else 8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=10, help="日志打印间隔")
@@ -104,7 +106,8 @@ if __name__ == "__main__":
     ckp_data = lm_checkpoint(lm_config, weight=args.lora_name, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = "cuda" if torch.device(args.device).type == "cuda" else "cpu"
+    args.dtype = resolve_dtype(args.dtype, args.device)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
@@ -119,7 +122,7 @@ if __name__ == "__main__":
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
-    apply_lora(model, rank=args.lora_rank)
+    apply_lora(model, rank=args.lora_rank, lora_alpha=args.lora_alpha)
     
     # 统计参数
     total_params = sum(p.numel() for p in model.parameters())
@@ -148,7 +151,7 @@ if __name__ == "__main__":
     if ckp_data:
         model.load_state_dict(ckp_data['model'], strict=False)
         optimizer.load_state_dict(ckp_data['optimizer'])
-        scaler.load_state_dict(ckp_data['scaler'])
+        if ckp_data.get('scaler'): scaler.load_state_dict(ckp_data['scaler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
     

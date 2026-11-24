@@ -23,17 +23,12 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import AgentRLDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, safe_math_eval
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, safe_math_eval, rep_penalty, resolve_dtype
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
 warnings.filterwarnings('ignore')
 
 # ================================ 工具与 Reward = Start ================================
-
-def rep_penalty(text, n=3, cap=0.5):
-    toks = re.findall(r"\w+|[^\w\s]", text.lower())
-    grams = [tuple(toks[i:i + n]) for i in range(len(toks) - n + 1)]
-    return min(cap, (len(grams) - len(set(grams))) * cap * 2 / len(grams)) if grams else 0.0
 
 # ======== 工具定义 ========
 TOOLS = [
@@ -78,19 +73,28 @@ def parse_tool_calls(text):
     for m in re.findall(r'<tool_call>(.*?)</tool_call>', text, re.DOTALL):
         try: call = json.loads(m.strip())
         except: continue
-        if isinstance(call, dict): calls.append(call)
+        if not isinstance(call, dict): continue
+        args = call.get("arguments", {})
+        if isinstance(args, str):
+            try: args = json.loads(args)
+            except (ValueError, RecursionError): args = {}
+        call["name"], call["arguments"] = str(call.get("name", "")), args if isinstance(args, dict) else {}
+        calls.append(call)
     return calls
 
-def execute_tool(name, args):
+def execute_tool(name, args, valid_names=None):
     fn = MOCK_RESULTS.get(name)
-    if not fn: return None
+    if not fn: return {"error": f"未知工具: {name}"}
+    if valid_names is not None and name not in valid_names: return {"error": f"当前样本未提供工具: {name}"}
+    if not CHECK_ARGS[name](args): return {"error": f"工具参数无效: {name}"}
     try:
         return fn(args)
-    except Exception:
-        return None
+    except Exception as e:
+        return {"error": f"工具执行失败: {str(e)[:80]}"}
 
 # ======== 多轮 Rollout ========
 def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
+    valid_names = {t['function']['name'] for t in tools} if tools else set()
     all_outputs = []
     prompt_ids = None
     response_ids = []
@@ -129,13 +133,8 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
         assistant_message = {"role": "assistant", "content": new_text}
         messages.append(assistant_message)
         for call in calls:
-            name, raw = call.get("name", ""), call.get("arguments", {})
-            if isinstance(raw, str):
-                try: raw = json.loads(raw)
-                except: raw = {}
-            if not isinstance(raw, dict): raw = {}
-            result = execute_tool(name, raw)
-            result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[:2048]  # 防止天文数字撑爆tokenizer
+            result = execute_tool(call["name"], call["arguments"], valid_names)
+            result_str = json.dumps(result, ensure_ascii=False)[:2048]  # 防止天文数字撑爆tokenizer
             messages.append({"role": "tool", "content": result_str})
 
         marker = f"<|agent_observation_{id(messages)}_{len(response_ids)}|>"
@@ -184,8 +183,8 @@ def rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, num_ge
 # ======== Reward 计算 ========
 def validate_gt_in_text(text, gt_list):
     text, text_num = str(text), str(text).replace(',', '')
-    nums = [float(x) for x in re.findall(r'(?<![\w.])[-+]?\d+(?:\.\d+)?(?![\w.])', text_num)]
-    return {g for g in gt_list if ((s := str(g).strip()) and s.lower() in text.lower()) or (re.fullmatch(r'[-+]?\d+(?:\.\d+)?', str(g).strip().replace(',', '')) and any(abs(float(str(g).strip().replace(',', '')) - n) < 1e-6 for n in nums))}
+    nums = [float(x) for x in re.findall(r'(?<![A-Za-z0-9_.])[-+]?\d+(?:\.\d+)?(?![A-Za-z0-9_]|\.\d)', text_num)]
+    return {g for g in gt_list if (s := str(g).strip()) and (any(abs(float(s.replace(',', '')) - n) < 1e-6 for n in nums) if re.fullmatch(r'[-+]?\d+(?:\.\d+)?', s.replace(',', '')) else s.lower() in text.lower())}
 
 def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, reward_model=None, device="cuda", turn_outputs_batch=None, unfinished_batch=None):
     rewards = torch.zeros(len(completions), device=device)
@@ -223,11 +222,7 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
             gt = gt_batch[sample_idx]
             valid_call_count = 0
             for tool_call in tool_calls:
-                name, raw = tool_call.get("name", ""), tool_call.get("arguments", {})
-                if isinstance(raw, str):
-                    try: raw = json.loads(raw)
-                    except: raw = {}
-                if not isinstance(raw, dict): raw = {}
+                name, raw = tool_call["name"], tool_call["arguments"]
                 check = CHECK_ARGS.get(name)
                 valid_call_count += int(bool(name in valid_names and check and check(raw)))
             tool_gap = abs(valid_call_count - len(gt)) + max(0, len(tool_calls) - valid_call_count)  # tool数差值
@@ -376,7 +371,7 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=3e-7, help="学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="数据类型 bfloat16/float16")
-    parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=0 if os.name == 'nt' else 8, help="数据加载线程数")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=1, help="日志打印间隔")
@@ -417,7 +412,8 @@ if __name__ == "__main__":
                                max_seq_len=args.max_seq_len + args.max_gen_len, use_moe=bool(args.use_moe))
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
 
-    device_type = "cuda" if "cuda" in args.device else "cpu"
+    device_type = "cuda" if torch.device(args.device).type == "cuda" else "cpu"
+    args.dtype = resolve_dtype(args.dtype, args.device)
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
 

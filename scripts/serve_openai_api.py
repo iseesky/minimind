@@ -44,13 +44,14 @@ def init_model(args):
     else:
         model = AutoModelForCausalLM.from_pretrained(args.load_from, trust_remote_code=True)
     print(f'MiniMind模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)')
-    return model.half().eval().to(device), tokenizer
+    if torch.device(device).type == 'cuda': model = model.half()
+    return model.eval().to(device), tokenizer
 
 
 class ChatRequest(BaseModel):
     model: str
     messages: list
-    temperature: float = 0.7
+    temperature: float = Field(default=0.7, ge=0.0, allow_inf_nan=False)
     top_p: float = 0.92
     max_tokens: int = 8192
     stream: bool = True
@@ -115,7 +116,7 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
                 model.generate(
                     inputs.input_ids,
                     max_new_tokens=max_tokens,
-                    do_sample=True,
+                    do_sample=temperature > 0,
                     temperature=temperature,
                     top_p=top_p,
                     attention_mask=inputs.attention_mask,
@@ -199,7 +200,7 @@ def generate_stream_response(messages, temperature, top_p, max_tokens, tools=Non
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+def chat_completions(request: ChatRequest):
     try:
         if request.stream:
             return StreamingResponse(
@@ -226,7 +227,7 @@ async def chat_completions(request: ChatRequest):
                 generated_ids = model.generate(
                     inputs["input_ids"],
                     max_new_tokens=request.max_tokens,
-                    do_sample=True,
+                    do_sample=request.temperature > 0,
                     attention_mask=inputs["attention_mask"],
                     pad_token_id=tokenizer.pad_token_id,
                     eos_token_id=tokenizer.eos_token_id,
