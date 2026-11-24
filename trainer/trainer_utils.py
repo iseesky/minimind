@@ -230,8 +230,16 @@ def safe_math_eval(expression):
     if not expr or len(expr) > 512: raise ValueError('表达式为空或过长')
     try:
         return walk(ast.parse(expr, mode='eval').body)
-    except (KeyError, SyntaxError, TypeError):
-        raise ValueError('不支持的表达式语法') from None
+    except (KeyError, SyntaxError, TypeError, ValueError, ArithmeticError,
+            AttributeError, IndexError, RecursionError):
+        # [PATCH] 求值期异常必须全部收敛为 ValueError：
+        # 旧白名单漏掉 ZeroDivisionError(1/0)、OverflowError(exp(1000))、
+        # ValueError(math.sqrt(-1) 或 pow_guard 主动拒绝大幂) 等。
+        # train_agent.py 的 execute_tool 虽有 except Exception 兜底，但会把
+        # 底层异常消息塞进 observation，把「表达式写错」误教成「工具坏了」；
+        # eval_toolcall.py / web_demo.py 直接调用时则会真的崩溃。
+        # AST 已限制语法与函数白名单，此处捕获不会掩盖代码缺陷。
+        raise ValueError('不支持的表达式或求值失败') from None
 
 
 # ======== 重复惩罚 ========

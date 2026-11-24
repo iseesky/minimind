@@ -309,7 +309,10 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         grouped_rewards = rewards.view(-1, args.num_generations)
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)
-        advantages = (rewards - mean_r) / (std_r + 1e-4)
+        # [PATCH] 与 train_grpo.py 同源缺陷：Agent-RL 主循环同样存在退化组问题，
+        # 低方差组的浮点残差会被归一化成 O(1) 伪 advantage。修复方式保持一致。
+        advantages = (rewards - mean_r) / std_r.clamp(min=1e-2)
+        advantages = torch.where(std_r >= 1e-2, advantages, torch.zeros_like(advantages))
 
         kl_div = ref_per_token_logps - per_token_logps
         per_token_kl = torch.exp(kl_div) - kl_div - 1

@@ -115,7 +115,12 @@ def grpo_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_mod
         grouped_rewards = rewards.view(-1, args.num_generations)  # [B, num_gen]
         mean_r = grouped_rewards.mean(dim=1).repeat_interleave(args.num_generations)  # [B*num_gen]
         std_r = grouped_rewards.std(dim=1, unbiased=False).repeat_interleave(args.num_generations)  # [B*num_gen]
-        advantages = (rewards - mean_r) / (std_r + 1e-4)  # [B*num_gen]
+        # [PATCH] 退化组保护：同组 reward 几乎全相等时 std≈0，旧式 (std + 1e-4)
+        # 只在 std<1e-4 时起效；std 落在 [1e-4, 1e-2) 仍会把浮点残差归一化成
+        # O(1) 的伪 advantage，让模型对纯噪声学出偏好。改为分母 clamp 下限 1e-2，
+        # 并对无相对偏好信号的退化组直接置零。
+        advantages = (rewards - mean_r) / std_r.clamp(min=1e-2)
+        advantages = torch.where(std_r >= 1e-2, advantages, torch.zeros_like(advantages))  # [B*num_gen]
 
         completion_pad_mask = rollout_result.completion_mask.to(args.device).bool()
         is_eos = (completion_ids == tokenizer.eos_token_id) & completion_pad_mask  # [B*num_gen, R]

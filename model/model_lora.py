@@ -20,9 +20,19 @@ class LoRA(nn.Module):
         return self.B(self.A(x)) * self.scaling
 
 
-def apply_lora(model, rank=16, lora_alpha=None):
+# [PATCH] 允许注入 LoRA 的投影层白名单（按模块名末段匹配）。
+# 旧实现用 in_features == out_features 判据，只覆盖 q_proj/o_proj 这类方阵：
+# GQA 下 k_proj/v_proj、整个 FFN（gate/up/down_proj）以及 MoE 专家全部漏注入。
+# lm_head 与 embed_tokens 权重共享且词表维度巨大，MoE 的 gate 是路由层，均刻意排除。
+# 兼容性：新注入层的 B 初始化为 0，旧 checkpoint 经 load_lora(strict=False) 加载后
+# 缺失键保持 B=0，delta=0，输出与旧模型完全一致。
+LORA_TARGET_SUFFIXES = ('q_proj', 'k_proj', 'v_proj', 'o_proj',
+                        'gate_proj', 'up_proj', 'down_proj')
+
+
+def apply_lora(model, rank=16, lora_alpha=None, target_suffixes=LORA_TARGET_SUFFIXES):
     for name, module in model.named_modules():
-        if isinstance(module, nn.Linear) and module.in_features == module.out_features:
+        if isinstance(module, nn.Linear) and name.split('.')[-1] in target_suffixes:
             lora = LoRA(module.in_features, module.out_features, rank=rank, lora_alpha=lora_alpha).to(model.device)
             setattr(module, "lora", lora)
             original_forward = module.forward
